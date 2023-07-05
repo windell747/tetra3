@@ -309,15 +309,26 @@ class Tetra3():
         """dict: Dictionary of database properties.
 
         Keys:
-            - 'pattern_mode': Method used to identify star patterns.
+            - 'pattern_mode': Method used to identify star patterns. Is always 'edge_ratio'.
             - 'pattern_size': Number of stars in each pattern.
             - 'pattern_bins': Number of bins per dimension in pattern catalog.
-            - 'pattern_max_error' Maximum difference allowed in pattern for a match.
-            - 'max_fov': Maximum angle between stars in the same pattern (Field of View; degrees).
+            - 'pattern_max_error': Maximum difference allowed in pattern for a match.
+            - 'max_fov': Maximum camera horizontal field of view (in degrees) the database is built for.
+                This will also be the angular extent of the largest pattern.
+            - 'min_fov': Minimum camera horizontal field of view (in degrees) the database is built for.
+                This drives the density of stars in the database, patterns may be smaller than this.
             - 'pattern_stars_per_fov': Number of stars used for patterns in each region of size
-              'max_fov'.
-            - 'verification_stars_per_fov': Number of stars in catalog in each region of size 'max_fov'.
+              'min_fov'.
+            - 'verification_stars_per_fov': Number of stars in catalog in each region of size 'min_fov'.
             - 'star_max_magnitude': Dimmest apparent magnitude of stars in database.
+            - 'star_catalog': Name of the star catalog (e.g. bcs5, hip_main, tyc_main) the database was
+                built from. Returns 'unknown' for old databases where this data was not saved.
+            - 'simplify_pattern': Indicates if pattern simplification was used when building the database.
+            - 'presort_patterns': Indicates if the pattern indices are sorted by distance to the centroid.
+            - 'range_ra': The portion of the sky in right ascension (min, max) that is in the database
+                (degrees 0 to 360). If None, the whole sky is included.
+            - 'range_dec': The portion of the sky in declination (min, max) that is in the database
+                (degrees -90 to 90). If None, the whole sky is included.
         """
         return self._db_props
 
@@ -366,6 +377,9 @@ class Tetra3():
                 elif key == 'presort_patterns':
                     self._db_props[key] = False
                     self._logger.debug('No presort_patterns key, set to False')
+                elif key == 'star_catalog':
+                    self._db_props[key] = 'unknown'
+                    self._logger.debug('No star_catalog key, set to unknown')
                 else:
                     self._db_props[key] = None
                     self._logger.warning('Missing key in database (likely version difference): ' + str(key))
@@ -820,7 +834,7 @@ class Tetra3():
 
     def solve_from_image(self, image, fov_estimate=None, fov_max_error=None,
                          pattern_checking_stars=8, match_radius=.01, match_threshold=1e-3,
-                         **kwargs):
+                         solve_timeout=None, target_pixel=None, **kwargs):
         """Solve for the sky location of an image.
 
         Star locations (centroids) are found using :meth:`tetra3.get_centroids_from_image` and
@@ -847,6 +861,12 @@ class Tetra3():
                 as a fraction of the image field of view.
             match_threshold (float, optional): Maximum allowed false-positive probability to accept
                 a tested pattern a valid match. Default 1e-3. NEW: Corrected for the database size.
+            solve_timeout (float, optional): Timeout in milliseconds after which the solver will
+                give up on matching patterns. Defaults to None.
+            target_pixel (numpy.ndarray, optional): Pixel coordiates to return RA/Dec for in
+                addition to the default (the centre of the image). Size (N,2) where each row is the
+                (y, x) coordinate measured from top left corner of the image. Defaults to None. Only
+                available if fov_estimate is given; this FOV is used for the offset calculation.
             **kwargs (optional): Other keyword arguments passed to
                 :meth:`tetra3.get_centroids_from_image`.
 
@@ -861,13 +881,18 @@ class Tetra3():
                 - 'Prob': Probability that the solution is a false-positive.
                 - 'T_solve': Time spent searching for a match in milliseconds.
                 - 'T_extract': Time spent exctracting star centroids in milliseconds.
+                - 'RA_target': Right ascension in degrees of the pixel positions passed in
+                    target_pixel. Not included if target_pixel=None (the default).
+                - 'Dec_target': Declination in degrees of the pixel positions in target_pixel.
+                    Not included if target_pixel=None (the default).
 
                 If unsuccsessful in finding a match,  None is returned for all keys of the
                 dictionary except 'T_solve' and 'T_exctract'.
         """
         assert self.has_database, 'No database loaded'
         self._logger.debug('Got solve from image with input: ' + str((image, fov_estimate,
-            fov_max_error, pattern_checking_stars, match_radius, match_threshold, kwargs)))
+            fov_max_error, pattern_checking_stars, match_radius, match_threshold,
+            solve_timeout, target_pixel, kwargs)))
         image = np.asarray(image, dtype=np.float32)
         (height, width) = image.shape[:2]
         self._logger.debug('Image (height, width): ' + str((height, width)))
@@ -881,13 +906,15 @@ class Tetra3():
         solution = self.solve_from_centroids(centroids, (height, width), 
             fov_estimate=fov_estimate, fov_max_error=fov_max_error,
             pattern_checking_stars=pattern_checking_stars, match_radius=match_radius,
-            match_threshold=match_threshold)
+            match_threshold=match_threshold, solve_timeout=solve_timeout,
+            target_pixel=target_pixel)
         # Add extraction time to results and return
         solution['T_extract'] = t_extract
         return solution
 
     def solve_from_centroids(self, star_centroids, size, fov_estimate=None, fov_max_error=None,
-                             pattern_checking_stars=8, match_radius=.01, match_threshold=1e-3):
+                             pattern_checking_stars=8, match_radius=.01, match_threshold=1e-3,
+                             solve_timeout=None, target_pixel=None):
         """Solve for the sky location using a list of centroids.
 
         Use :meth:`tetra3.get_centroids_from_image` or your own centroiding algorithm to find an
@@ -923,6 +950,12 @@ class Tetra3():
                 as a fraction of the image field of view. Default 0.01.
             match_threshold (float, optional): Maximum allowed false-positive probability to accept
                 a tested pattern a valid match. Default 1e-3. NEW: Corrected for the database size.
+            solve_timeout (float, optional): Timeout in milliseconds after which the solver will
+                give up on matching patterns. Defaults to None.
+            target_pixel (numpy.ndarray, optional): Pixel coordiates to return RA/Dec for in
+                addition to the default (the centre of the image). Size (N,2) where each row is the
+                (y, x) coordinate measured from top left corner of the image. Defaults to None. Only
+                available if fov_estimate is given; this FOV is used for the offset calculation.
 
         Returns:
             dict: A dictionary with the following keys is returned:
@@ -934,6 +967,10 @@ class Tetra3():
                 - 'Matches': Number of stars in the image matched to the database.
                 - 'Prob': Probability that the solution is a false-positive.
                 - 'T_solve': Time spent searching for a match in milliseconds.
+                - 'RA_target': Right ascension in degrees of the pixel positions passed in
+                    target_pixel. Not included if target_pixel=None (the default).
+                - 'Dec_target': Declination in degrees of the pixel positions in target_pixel.
+                    Not included if target_pixel=None (the default).
 
                 If unsuccsessful in finding a match,  None is returned for all keys of the
                 dictionary except 'T_solve'.
@@ -941,7 +978,8 @@ class Tetra3():
         assert self.has_database, 'No database loaded'
         self._logger.debug('Got solve from centroids with input: '
                            + str((len(star_centroids), size, fov_estimate, fov_max_error,
-                                  pattern_checking_stars, match_radius, match_threshold)))
+                                  pattern_checking_stars, match_radius, match_threshold,
+                                  solve_timeout, target_pixel)))
 
         star_centroids = np.asarray(star_centroids)
         if fov_estimate is None:
@@ -958,6 +996,15 @@ class Tetra3():
         self._logger.debug('Set threshold to: ' + str(match_threshold) + ', have '
             + str(num_patterns) + ' patterns.')
         pattern_checking_stars = int(pattern_checking_stars)
+        if solve_timeout is not None:
+            # Convert to seconds to match timestamp
+            solve_timeout = float(solve_timeout) / 1000
+        if target_pixel is not None:
+            assert fov_estimate is not None, 'Must give fov_estimate to use target_pixel postions'
+            target_pixel = np.array(target_pixel)
+            if target_pixel.ndim == 1:
+                # Make shape (2,) array to (1,2), to match (N,2) pattern
+                target_pixel = target_pixel[None, :]
 
         # extract height (y) and width (x) of image
         (height, width) = size[:2]
@@ -989,6 +1036,12 @@ class Tetra3():
         t0_solve = precision_timestamp()
         for image_centroids in _generate_patterns_from_centroids(
                                             star_centroids[:pattern_checking_stars], p_size):
+            # Check if timeout has elapsed, then we must give up
+            if solve_timeout is not None:
+                elapsed_time = precision_timestamp() - t0_solve
+                if elapsed_time > solve_timeout:
+                    self._logger.debug('Timeout reached after: ' + str(elapsed_time) + 's.')
+                    break
             if fov_estimate is None:
                 # Calculate the largest distance in pixels between centroids, for future FOV estimation.
                 pattern_largest_distance = np.max(norm(
@@ -1159,16 +1212,31 @@ class Tetra3():
                                                     norm(rotation_matrix[1:3, 2])))
                         roll = np.rad2deg(np.arctan2(rotation_matrix[1, 2],
                                                      rotation_matrix[2, 2])) % 360
-                        self._logger.debug("RA:    %03.8f" % ra + ' deg')
-                        self._logger.debug("DEC:   %03.8f" % dec + ' deg')
-                        self._logger.debug("ROLL:  %03.8f" % roll + ' deg')
-                        self._logger.debug("FOV:   %03.8f" % np.rad2deg(fov) + ' deg')
-                        self._logger.debug('MATCH: %i' % num_star_matches + ' stars')
-                        self._logger.debug('SOLVE: %.2f' % round(t_solve, 2) + ' ms')
-                        self._logger.debug('RESID: %.2f' % residual + ' asec')
-                        return {'RA': ra, 'Dec': dec, 'Roll': roll, 'FOV': np.rad2deg(fov),
-                                'RMSE': residual, 'Matches': num_star_matches,
-                                'Prob': prob_mismatch*num_patterns, 'T_solve': t_solve}
+                        solution_dict = {'RA': ra, 'Dec': dec, 'Roll': roll,
+                                         'FOV': np.rad2deg(fov), 'RMSE': residual,
+                                         'Matches': num_star_matches,
+                                         'Prob': prob_mismatch*num_patterns,
+                                         'T_solve': t_solve}
+
+                        # If we were given target pixel(s), calculate their ra/dec
+                        if target_pixel is not None:
+                            self._logger.debug('Calculate RA/Dec for targets: '
+                                + str(target_pixel))
+                            target_vectors = compute_vectors(target_pixel, fov_initial)
+                            rotated_target_vectors = np.dot(rotation_matrix.T, target_vectors.T).T
+                            target_ra = np.rad2deg(np.arctan2(rotated_target_vectors[:,1],
+                                                              rotated_target_vectors[:,0])) % 360
+                            target_dec = 90 - np.rad2deg(
+                                np.arccos(np.dot(rotated_target_vectors, [0,0,1])))
+                            if target_ra.shape[0] > 1:
+                                solution_dict['RA_target'] = target_ra.tolist()
+                                solution_dict['Dec_target'] = target_dec.tolist()
+                            else:
+                                solution_dict['RA_target'] = target_ra[0]
+                                solution_dict['Dec_target'] = target_dec[0]
+
+                        self._logger.debug(solution_dict)
+                        return solution_dict
         
         # Failed to solve, get time and return None
         t_solve = (precision_timestamp() - t0_solve) * 1000
@@ -1301,35 +1369,6 @@ def get_centroids_from_image(image, sigma=2, image_th=None, crop=None, downsampl
             with the results as defined previously and a dictionary with images and data of partial
             results.
     """
-
-    # bg_sub_mode and sigma_mode:
-    # local_median, global_median, global_mean
-
-    # Versatile spot extractor for images, used in tetra3 for wide fields and
-    # in satellite closed-loop tracking.
-    # PROCESS:
-    # 0. Convert to numpy single precision greyscale (32-bit float)
-    # 1. Crop by factor 'crop' if not None (centered crop)
-    # 2. Downsample by factor 'downsample' if not None (sums values)
-    # 3. Subtract background by median filter of 'filtsize' width (odd)
-    # [Set filtsize=None to do single value background subtraction]
-    # 4. If local_sigma False:
-    #        Find RMS or 1.48*MAD for image as global standard deviation
-    #    If local_sigma True:
-    #        Find RMS or 1.48*MAD for local areas of 'filtsize' width to use
-    #        as a pixel-by-pixel estimate of the local standard deviation
-    # 5. Threshold by sigma*[local/global] standard deviation if image_th None, else use image_th
-    # 6. Find area and moments for each region, apply thresholds
-    # 7. Sort by sum, keep at most 'max_returned'
-    # 8. Correct for effects of crop and downsample
-    # RETURNS:
-    # Default: Numpy array size Nx2 with y,x centroid positions (y down, x right)
-    # return_moments=True: 5-tuple with Numpy arrays:
-    #    0: size Nx2 with y,x centroid positions
-    #    1: size N with sum (zeroth moment)
-    #    2: size N with area (pixels)
-    #    3: size Nx3 with xx,yy,xy variances (second moment)
-    #    4: size N with ratio of major/minor axis
 
     # 1. Ensure image is float np array and 2D:
     image = np.asarray(image, dtype=np.float32)
