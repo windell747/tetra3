@@ -1169,7 +1169,9 @@ class Tetra3():
                 - 'Roll': Rotation of image relative to north celestial pole.
                 - 'FOV': Calculated horizontal field of view of the provided image.
                 - 'distortion': Calculated distortion of the provided image.
-                - 'RMSE': RMS residual of matched stars in arcseconds.
+                - 'RA RMSE': RA RMS residual of matched stars in arcseconds.
+                - 'DEC RMSE': DEC RMS residual of matched stars in arcseconds.
+                - 'ROLL RMSE': ROLL RMS residual of matched stars in arcseconds.
                 - 'Matches': Number of stars in the image matched to the database.
                 - 'Prob': Probability that the solution is a false-positive.
                 - 'epoch_equinox': The celestial RA/Dec equinox reference epoch.
@@ -1287,7 +1289,9 @@ class Tetra3():
                 - 'Roll': Rotation of image relative to north celestial pole.
                 - 'FOV': Calculated horizontal field of view of the provided image.
                 - 'distortion': Calculated distortion of the provided image.
-                - 'RMSE': RMS residual of matched stars in arcseconds.
+                - 'RA RMSE': RA RMS residual of matched stars in arcseconds.
+                - 'DEC RMSE': DEC RMS residual of matched stars in arcseconds.
+                - 'ROLL RMSE': ROLL RMS residual of matched stars in arcseconds.
                 - 'Matches': Number of stars in the image matched to the database.
                 - 'Prob': Probability that the solution is a false-positive.
                 - 'epoch_equinox': The celestial RA/Dec equinox reference epoch.
@@ -1655,16 +1659,18 @@ class Tetra3():
                         final_match_vectors = np.dot(rotation_matrix.T, final_match_vectors.T).T
 
                         # Calculate residual angles with more accurate formula
-                        distance = norm(final_match_vectors - matched_catalog_vectors, axis=1)
-                        angle = 2 * np.arcsin(.5 * distance)
-                        residual = np.rad2deg(np.sqrt(np.mean(angle**2))) * 3600
+                        ra_residual, dec_residual, roll_residual = calculate_residuals(rotation_matrix,
+                                                                                       final_match_vectors,
+                                                                                       matched_catalog_vectors)
 
                         # Solved in this time
                         t_solve = (precision_timestamp() - t0_solve)*1000
                         solution_dict = {'RA': ra, 'Dec': dec,
                                          'Roll': roll,
                                          'FOV': np.rad2deg(fov), 'distortion': k,
-                                         'RMSE': residual,
+                                         'RA RMSE': ra_residual,
+                                         'DEC RMSE': dec_residual,
+                                         'ROLL RMSE': roll_residual,
                                          'Matches': num_star_matches,
                                          'Prob': prob_mismatch*num_patterns,
                                          'epoch_equinox': self._db_props['epoch_equinox'],
@@ -1748,7 +1754,7 @@ class Tetra3():
         self._logger.debug('FAIL: Did not find a match to the stars! It took '
                            + str(round(t_solve)) + ' ms.')
         return {'RA': None, 'Dec': None, 'Roll': None, 'FOV': None, 'distortion': None,
-                'RMSE': None, 'Matches': None, 'Prob': None, 'epoch_equinox': None,
+                'RA RMSE': None,'DEC RMSE': None,'ROLL RMSE': None, 'Matches': None, 'Prob': None, 'epoch_equinox': None,
                 'epoch_proper_motion': None, 'T_solve': t_solve}
 
     def _get_nearby_stars(self, vector, radius):
@@ -2250,3 +2256,39 @@ def crop_and_downsample_image(image, crop=None, downsample=None, sum_when_downsa
         return (image, (offs_h, offs_w))
     else:
         return image
+
+  def calculate_residuals(rotation_matrix, final_match_vectors, matched_catalog_vectors):
+        # recalculate the image center
+        center_vector = rotation_matrix[0, :]  # this extracts the x-axis basis vector.
+        inplane_angles = []
+        ra_angles = []
+        dec_angles = []
+        for element in range(0, len(final_match_vectors)):
+            u1 = final_match_vectors[element]
+            u2 = matched_catalog_vectors[element]
+            # Normalize the vector and unit vectors
+            center_vector = center_vector / norm(center_vector)
+            u1 = u1 / norm(u1)
+            u2 = u2 / norm(u2)
+            # Calculate the projection of u1 onto the plane
+            proj_u1 = u1 - np.dot(u1, center_vector) * center_vector
+            # Calculate the projection of u2 onto the plane
+            proj_u2 = u2 - np.dot(u2, center_vector) * center_vector
+            proj_u1 = proj_u1 / norm(proj_u1)
+            proj_u2 = proj_u2 / norm(proj_u2)
+            # Calculate the in-plane angle between the projected vectors
+            inplane_angle = np.rad2deg(np.arccos(np.dot(proj_u1, proj_u2) / (norm(proj_u1) * norm(proj_u2)))) * 3600
+            inplane_angles.append(inplane_angle)
+            # calculate the RA and DEC residuals.
+            theta1 = np.rad2deg(math.atan2(u1[1], u1[0]))
+            phi1 = np.rad2deg(math.asin(u1[2]))
+            theta2 = np.rad2deg(math.atan2(u2[1], u2[0]))
+            phi2 = np.rad2deg(math.asin(u2[2]))
+            ra_angle = np.fabs(theta1 - theta2) * 3600
+            dec_angle = np.fabs(phi1 - phi2) * 3600
+            ra_angles.append(ra_angle)
+            dec_angles.append(dec_angle)
+        ra_residual = np.sqrt(np.mean(np.square(ra_angles)))
+        dec_residual = np.sqrt(np.mean(np.square(dec_angles)))
+        roll_residual = np.sqrt(np.mean(np.square(inplane_angles)))
+        return ra_residual, dec_residual, roll_residual
